@@ -2,15 +2,16 @@
 Aula 2 / Atividade 3-A — Inserir 30 reviews fictícias da QC no Cosmos DB.
 
 Demonstra:
-- Cliente Cosmos com DefaultAzureCredential (sem chave hardcoded).
+- Cliente Cosmos autenticado por key lida do Key Vault (sem chave hardcoded).
 - Upsert de documentos com partition key.
 - Query particionada.
 
 Variáveis de ambiente necessárias:
-    COSMOS_ENDPOINT — endpoint do Cosmos DB (terraform output -raw cosmos_endpoint)
+    COSMOS_ENDPOINT  — endpoint do Cosmos DB (terraform output -raw cosmos_endpoint)
+    KEY_VAULT_NAME   — nome do Key Vault (terraform output -raw key_vault_name)
 
 Dependências:
-    pip install --user azure-identity azure-cosmos
+    pip install --user azure-identity azure-cosmos azure-keyvault-secrets
 """
 
 import os
@@ -18,6 +19,7 @@ import random
 
 from azure.cosmos import CosmosClient
 from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
 # Templates de reviews — variados por sentimento
 TEMPLATES = [
@@ -36,9 +38,23 @@ TEMPLATES = [
 
 def main():
     endpoint = os.environ["COSMOS_ENDPOINT"]
-    credential = DefaultAzureCredential()
+    kv_name = os.environ["KEY_VAULT_NAME"]
 
-    client = CosmosClient(endpoint, credential=credential)
+    # IMPORTANTE — por que key e não DefaultAzureCredential direto no Cosmos:
+    # o Cloud Shell NÃO consegue emitir token AAD para a audience de data-plane
+    # do Cosmos (https://<conta>.documents.azure.com) — todas as credenciais
+    # falham com AudienceNotSupported. Então autenticamos no Cosmos com a KEY,
+    # lida do Key Vault (cujo token AAD funciona no Cloud Shell) — sem hardcode.
+    # Em produção (Function/Container com Managed Identity própria) dá para usar
+    # CosmosClient(endpoint, credential=DefaultAzureCredential()) direto, graças à
+    # role data-plane concedida no Terraform (azurerm_cosmosdb_sql_role_assignment).
+    kv = SecretClient(
+        vault_url=f"https://{kv_name}.vault.azure.net",
+        credential=DefaultAzureCredential(),
+    )
+    cosmos_key = kv.get_secret("cosmos-primary-key").value
+
+    client = CosmosClient(endpoint, credential=cosmos_key)
     db = client.get_database_client("qc-db")
     container = db.get_container_client("reviews")
 

@@ -140,7 +140,7 @@ az storage blob list \
 
 ---
 
-## Atividade 2 — Azure SQL Free Offer + Key Vault + Python
+## Atividade 2 — Azure SQL Serverless + Key Vault + Python
 
 **Objetivo:** Popular a tabela `T_PRODUTOS` no Azure SQL **lendo a connection string do Key Vault** (sem hardcoded) e os dados do **CSV no Blob**.
 
@@ -148,7 +148,7 @@ az storage blob list \
 
 Abra [sql.tf](terraform/sql.tf) e [keyvault.tf](terraform/keyvault.tf). Observe:
 
-- **`azurerm_mssql_database.qc`** — banco SQL no **Free Offer** (`use_free_limit = true`): 100k vCore-seconds/mês + 32GB grátis, com auto-pause após 60 min de inatividade.
+- **`azurerm_mssql_database.qc`** — banco SQL **General Purpose Serverless** (`GP_S_Gen5_2`) com **auto-pause** após 60 min de inatividade: pausado, paga-se só o storage (centavos), e com o destroy ao final o custo é desprezível. *(A "oferta gratuita" do Azure SQL ainda não tem suporte no provider azurerm liberado — [PR #32055](https://github.com/hashicorp/terraform-provider-azurerm/pull/32055) — por isso usamos serverless com auto-pause.)*
 - **`azurerm_mssql_firewall_rule.cloud_shell`** — libera o IP do Cloud Shell automaticamente (usando o data source `http.meu_ip`).
 - **`azurerm_key_vault.qc`** — Vault com **RBAC habilitado** (sem usar Access Policies legadas).
 - **`azurerm_key_vault_secret.sql_connection`** — a connection string completa, armazenada como segredo.
@@ -198,7 +198,7 @@ Anote no `respostas-aula02.md` do seu fork:
 
 ---
 
-## Atividade 3 — Cosmos DB Free Tier + Azure AI Search
+## Atividade 3 — Cosmos DB Serverless + Azure AI Search
 
 **Objetivo:** Inserir reviews dos clientes da QC no Cosmos DB (NoSQL) e indexar o catálogo no Azure AI Search com semantic ranking — base para o RAG dos agentes.
 
@@ -208,39 +208,25 @@ Anote no `respostas-aula02.md` do seu fork:
 
 Abra [cosmos.tf](terraform/cosmos.tf):
 
-- **`azurerm_cosmosdb_account.qc`** — conta Cosmos com **`free_tier_enabled = true`** (1000 RU/s + 25GB grátis) e modo **Serverless** (paga por request).
+- **`azurerm_cosmosdb_account.qc`** — conta Cosmos em modo **Serverless** (paga por operação). Custo das 4h de aula ≈ centavos.
 - **Container `reviews`** particionado por `/produto_id`.
 
-> **Atenção:** O Free Tier permite **1 conta Cosmos por subscription**. Se o `apply` inicial falhou aqui, marque `free_tier_enabled = false` em `cosmos.tf` (terá custo simbólico) ou destrua outra conta Cosmos existente.
+> **Por que não Free Tier?** O Free Tier do Cosmos só beneficia *provisioned throughput* (não serverless) e o Azure permite **apenas 1 conta free-tier por assinatura** — o que trava o `apply` se já houver outra. Por isso o lab usa serverless sem free-tier (`var.cosmos_free_tier = false`). Para ligar mesmo assim: `terraform apply -var="cosmos_free_tier=true"`.
 
-#### Passo 2 — Conceder permissão de Data Plane no Cosmos
+#### Passo 2 — Como o script autentica no Cosmos (key via Key Vault)
 
-O Cosmos exige role específica para indexar/consultar via Python:
+Aqui há uma **pegadinha importante do Cloud Shell**: ele **não consegue emitir token AAD** para a audience de data-plane do Cosmos (`https://<conta>.documents.azure.com`) — qualquer tentativa de `DefaultAzureCredential` falha com `AudienceNotSupported`. Diferente de Key Vault, Blob e AI Search, que têm audience suportada.
 
-```bash
-COSMOS_NAME=$(cd ~/aie-cloud/aulas/02-storage-bancos/lab/terraform && terraform output -raw cosmos_account_name)
-RG=$(cd ~/aie-cloud/aulas/02-storage-bancos/lab/terraform && terraform output -raw resource_group_name)
-MY_ID=$(az ad signed-in-user show --query id -o tsv)
+Por isso o [popular_reviews.py](scripts/popular_reviews.py) autentica no Cosmos com a **key**, lida do **Key Vault** (segredo `cosmos-primary-key`, provisionado pelo Terraform em [keyvault.tf](terraform/keyvault.tf)). É o mesmo padrão "segredo no Vault" do SQL — sem chave hardcoded no código.
 
-az cosmosdb sql role assignment create \
-  --account-name "$COSMOS_NAME" \
-  --resource-group "$RG" \
-  --scope "/" \
-  --principal-id "$MY_ID" \
-  --role-definition-id 00000000-0000-0000-0000-000000000002
-
-# Aguardar propagação
-sleep 30
-```
-
-> **Por que via `az` e não Terraform?** A role data plane do Cosmos hoje é melhor concedida via CLI. Em produção, a Function/Agente que acessa o Cosmos teria sua **Managed Identity** com essa role.
+> **E a role data-plane?** O `cosmos.tf` também cria `azurerm_cosmosdb_sql_role_assignment` — mas ela serve para o cenário de **produção**: uma Function/Container com **Managed Identity** própria consegue token AAD para o Cosmos e usaria `DefaultAzureCredential` direto (sem key). A limitação é só do Cloud Shell.
 
 #### Passo 3 — Rodar o script de reviews
 
 [popular_reviews.py](scripts/popular_reviews.py) insere 30 reviews fictícias com diferentes scores.
 
 ```bash
-pip install --user azure-cosmos
+pip install --user azure-cosmos azure-keyvault-secrets azure-identity
 cd ~/aie-cloud/aulas/02-storage-bancos/lab/scripts
 python3 popular_reviews.py
 ```
@@ -263,8 +249,9 @@ Esperado: 30 reviews inseridas + listagem de reviews score ≥ 4 do produto 5.
 
 Abra [search.tf](terraform/search.tf):
 
-- **`azurerm_search_service.qc`** — Search service SKU **free** (3 índices, 50 MB) com `semantic_search_sku = "free"`.
+- **`azurerm_search_service.qc`** — Search service SKU **free** (3 índices, 50 MB), com **autenticação AAD/RBAC habilitada no data-plane** (`authentication_failure_mode`). Sem isso, o `DefaultAzureCredential` dos scripts levaria **403 Forbidden** mesmo com as roles.
 - **2 role assignments**: `Search Service Contributor` (gerencia índices) e `Search Index Data Contributor` (indexa/consulta documentos).
+- **`azapi_update_resource.search_semantic`** — habilita o **semantic ranker** (plano free, 1000 queries/mês). É feito via `azapi` porque o provider azurerm 3.x recusa esse ajuste quando o SKU é `free`, embora o Azure suporte. Sem ele, a busca semântica falharia com `Semantic search is not enabled for this service`.
 
 > **Atenção:** AI Search Free também é **1 por subscription**. Mesma lógica do Cosmos.
 
@@ -314,7 +301,7 @@ Tempo: ~5 minutos.
 ### Passo 2 — Verificar custo zero
 
 1. Portal → **Cost Management** → **Análise de custo** → filtrar por hoje
-2. Total deve estar próximo de $0 (Free Tiers + duração curta do lab)
+2. Total deve estar próximo de $0 (serverless/auto-pause + Search free + duração curta do lab)
 
 ### Passo 3 — Commitar progresso no seu fork
 
@@ -360,12 +347,17 @@ Esses recursos serão consumidos por:
 
 | Problema | Causa | Solução |
 |----------|-------|---------|
-| Terraform: "free_tier_enabled cannot be set to true" no Cosmos | Você já tem outra conta Cosmos com Free Tier nesta subscription | Trocar para `free_tier_enabled = false` (custo mínimo) ou destruir a outra conta |
+| `RequestDisallowedByAzure` / "best available regions" no apply | A política da conta Azure for Students bloqueia a região (ex.: `brazilsouth`) para esses recursos | Rode com uma região permitida: `terraform apply -var="location=eastus2"`. Para descobrir as permitidas, abra no portal a criação de um Storage Account e veja as regiões do dropdown |
+| Cosmos: "Free tier has already been applied to another account" | Já existe (ou existiu) outra conta Cosmos free-tier na assinatura | Já tratado: o lab usa serverless sem free-tier por padrão. Se você ligou com `-var="cosmos_free_tier=true"`, volte para `false` |
 | AI Search: limite de SKU Free atingido | 1 search service Free por subscription | Destruir o existente em outra subscription, ou usar SKU `basic` (~$60/mês — evite) |
 | Python: "Login failed for user 'sqladminqc'" | Senha do shell tinha `$` ou aspas — interpretado errado | Use `openssl rand -base64 24` (não contém caracteres problemáticos) ou guarde em variável escapada |
 | Python pyodbc: "Can't open lib 'ODBC Driver 18 for SQL Server'" | Cloud Shell pode ter v17 em vez de v18 | Mudar `driver = "{ODBC Driver 17 for SQL Server}"` no script |
+| pyodbc: "Invalid value specified for connection string attribute 'Encrypt'" | Connection string com `Encrypt=true`/`false` (sintaxe .NET); o ODBC exige `yes`/`no` | Já corrigido no `keyvault.tf` (`Encrypt=yes;TrustServerCertificate=no`). Se o segredo foi criado antes do fix, rode `terraform apply` de novo para atualizá-lo |
 | Key Vault: "Forbidden — the user does not have ... action" | RBAC ainda não propagou | `sleep 60` e tentar de novo |
-| Cosmos: "Request is unauthorized" | Falta role data plane | Rodar o `az cosmosdb sql role assignment create...` do Passo 2 da Parte A |
+| Cosmos: "Request is unauthorized" / `Forbidden` | Role data-plane ainda propagando (já é criada pelo Terraform em `cosmos.tf`) | Aguardar ~1 min e rodar de novo. Conferir: `az cosmosdb sql role assignment list --account-name <cosmos> -g <rg> -o table` |
+| Cosmos: `ClientAuthenticationError ... AudienceNotSupported` no Cloud Shell | O Cloud Shell não emite token AAD para a audience de data-plane do Cosmos (nenhuma credencial consegue) | Já tratado: o `popular_reviews.py` autentica por **key** lida do Key Vault (`cosmos-primary-key`). Afeta só o Cosmos (KV/Blob/Search têm audience suportada) |
+| AI Search: `Operation returned an invalid status 'Forbidden'` ao indexar | Serviço aceitava só API key no data-plane (token AAD recusado) | Já resolvido no `search.tf` (`authentication_failure_mode`). Em serviço criado antes do fix: `terraform apply` de novo |
+| AI Search: `Semantic search is not enabled for this service` | Semantic ranker não habilitado | Já resolvido via `azapi_update_resource.search_semantic` em `search.tf`. Em serviço antigo: `terraform apply` de novo (ou `az search service update --name <svc> -g <rg> --semantic-search free`) |
 | `terraform destroy` falha em Key Vault | Purge protection ou soft-delete | Confirmar `purge_protection_enabled = false` no `keyvault.tf` (já está) |
 | `AuthorizationPermissionMismatch` no upload Blob | Sem role data plane no Storage | Conceder `Storage Blob Data Contributor` (ver Passo 2 da L₁) |
 

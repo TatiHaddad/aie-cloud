@@ -1,12 +1,15 @@
-# Cosmos DB Account — Free Tier habilitado (apenas 1 por assinatura é permitido)
-# Se já houver outra Cosmos com free_tier nesta subscription, mude para false (terá custo simbólico).
+# Cosmos DB Account — modo Serverless (paga por operação).
+# free_tier_enabled fica DESLIGADO por padrão: o desconto do free-tier só vale
+# para provisioned throughput (não para serverless), e o Azure permite apenas
+# 1 conta free-tier por assinatura — o que trava o lab se já houver outra.
+# Em serverless o custo das 4h de aula é de centavos. Ligue via -var se quiser.
 resource "azurerm_cosmosdb_account" "qc" {
   name                = "cosmos-qc-${random_string.sufixo.result}"
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   offer_type          = "Standard"
   kind                = "GlobalDocumentDB"
-  free_tier_enabled   = true
+  free_tier_enabled   = var.cosmos_free_tier
 
   consistency_policy {
     consistency_level = "Session"
@@ -22,6 +25,19 @@ resource "azurerm_cosmosdb_account" "qc" {
   }
 
   tags = local.tags
+}
+
+# Role data-plane do Cosmos (Built-in Data Contributor, id ...0002).
+# OBS.: no Cloud Shell o lab autentica no Cosmos por KEY (o Cloud Shell não
+# emite token AAD para a audience do Cosmos). Esta role existe para o cenário
+# de PRODUÇÃO — uma Function/Container com Managed Identity usaria AAD direto,
+# sem key. Mantida como referência do padrão correto em prod.
+resource "azurerm_cosmosdb_sql_role_assignment" "qc_data" {
+  resource_group_name = azurerm_resource_group.rg.name
+  account_name        = azurerm_cosmosdb_account.qc.name
+  role_definition_id  = "${azurerm_cosmosdb_account.qc.id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
+  principal_id        = data.azurerm_client_config.current.object_id
+  scope               = azurerm_cosmosdb_account.qc.id
 }
 
 # Database
